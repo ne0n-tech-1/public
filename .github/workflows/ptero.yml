@@ -61,23 +61,30 @@ jobs:
             echo "cache-hit=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Install Composer
-        if: steps.restore.outputs.cache-hit == 'false'
-        run: curl -sS https://getcomposer.org/installer | sudo php -- --install-dir=/usr/local/bin --filename=composer
-
       - name: Install Tailscale client
         run: curl -fsSL https://tailscale.com/install.sh | sh
 
-      - name: Connect to Tailscale
+      - name: Connect to Tailscale with retry
         run: |
           sudo tailscaled &
           sleep 8
           sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=toknless || echo "Tailscale already up"
           
-          until sudo tailscale ip -4 | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; do
-            echo "Waiting for Tailscale IP..."
-            sleep 5
+          # Retry loop to ensure a Tailscale IP is available
+          for i in $(seq 1 10); do
+            echo "Attempt $i to get Tailscale IP..."
+            TAILSCALE_IP=$(sudo tailscale ip -4)
+            if [ -n "$TAILSCALE_IP" ]; then
+              echo "Tailscale IP is ready: $TAILSCALE_IP"
+              break
+            fi
+            sleep 10
           done
+          
+          if [ -z "$TAILSCALE_IP" ]; then
+            echo "❌ Failed to get Tailscale IP after multiple retries. Exiting."
+            exit 1
+          fi
 
       - name: Full Pterodactyl Installation (First Run Only)
         if: steps.restore.outputs.cache-hit == 'false'
@@ -147,12 +154,12 @@ jobs:
           # 6. Get Wings configuration token and configure Wings
           WINGS_TOKEN=$(sudo php artisan p:node:token ${WINGS_NODE_ID} | tail -n 1)
           sudo mkdir -p /etc/pterodactyl/
-          sudo /usr/local/bin/wings --config /etc/pterodactyl/config.yml &
-          sleep 5
-          sudo curl -L -o /etc/pterodactyl/config.yml http://${TAILSCALE_IP}:8080/api/nodes/${WINGS_TOKEN}/configuration
+          sudo curl -L -o /etc/pterodactyl/config.yml http://${TAILSCALE_IP}/api/nodes/${WINGS_TOKEN}/configuration
           
           # 7. Start Wings and set correct permissions
           sudo chown -R www-data:www-data /var/www/pterodactyl/*
+          sudo /usr/local/bin/wings --config /etc/pterodactyl/config.yml &
+
       - name: Create user toknless with sudo
         run: |
           if ! id -u toknless >/dev/null 2>&1; then
