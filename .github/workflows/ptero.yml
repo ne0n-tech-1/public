@@ -1,4 +1,4 @@
-name: Pterodactyl
+name: Continuous Persistent VPS with Pterodactyl (15-Min Test)
 
 on:
   workflow_dispatch:
@@ -62,19 +62,31 @@ jobs:
             echo "✅ Database restored."
           fi
 
+      - name: Install Tailscale Client
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
       - name: Connect to Tailscale
         run: |
           sudo hostnamectl set-hostname neonh0st
           sudo tailscaled &
-          sleep 8
+          sleep 5
           sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=neonh0st || echo "Tailscale already up"
+
+          # Wait for a valid IP address
+          until sudo tailscale ip -4 | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; do
+            echo "Waiting for Tailscale IP..."
+            sleep 5
+          done
+          echo "Tailscale IP is ready: $(tailscale ip -4)"
 
       - name: Pterodactyl Panel Installation (First Run Only)
         if: steps.restore.outputs.cache-hit == 'false'
         run: |
           echo "🚀 Starting Pterodactyl fresh installation..."
           DB_PASSWORD=$(openssl rand -base64 16 | tr -d "=\/\+")
-          
+          TAILSCALE_IP=$(sudo tailscale ip -4)
+
           # 1. Setup MariaDB
           sudo mysql -e "CREATE USER 'pterodactyl'@'127.0.0.1' IDENTIFIED BY '${DB_PASSWORD}';"
           sudo mysql -e "CREATE DATABASE pterodactyl;"
@@ -93,7 +105,7 @@ jobs:
           
           # 4. Run Artisan setup commands
           sudo php artisan key:generate --force
-          sudo php artisan p:environment:setup -n --author=admin@example.com --url=http://$(tailscale ip -4) --cache=redis --session=redis --queue=redis --redis-host=127.0.0.1 --redis-port=6379
+          sudo php artisan p:environment:setup -n --author=admin@example.com --url=http://${TAILSCALE_IP} --cache=redis --session=redis --queue=redis --redis-host=127.0.0.1 --redis-port=6379
           sudo php artisan p:environment:database -n --host=127.0.0.1 --port=3306 --database=pterodactyl --username=pterodactyl --password=${DB_PASSWORD}
           sudo php artisan migrate --seed --force
           
@@ -102,6 +114,44 @@ jobs:
           
           # 6. Set permissions and configure webserver
           sudo chown -R www-data:www-data /var/www/pterodactyl/*
+          
+      - name: Install SSH and Configure Webserver
+        run: |
+          sudo apt-get install -y openssh-server
+          sudo systemctl start ssh
+          sudo sh -c 'cat > /etc/nginx/sites-available/pterodactyl.conf <<EOL
+          server {
+              listen 80;
+              server_name $(tailscale ip -4);
+              root /var/www/pterodactyl/public;
+              index index.html index.htm index.php;
+              charset utf-8;
+              location / {
+                  try_files \$uri \$uri/ /index.php?\$query_string;
+              }
+              location = /favicon.ico { access_log off; log_not_found off; }
+              location = /robots.txt  { access_log off; log_not_found off; }
+              access_log  /var/log/nginx/pterodactyl.app-access.log;
+              error_log   /var/log/nginx/pterodactyl.app-error.log error;
+              location ~ \.php$ {
+                  fastcgi_split_path_info ^(.+\.php)(/.+)$;
+                  fastcgi_pass unix:/var/run/php/php8.2-fpm.sock;
+                  fastcgi_index index.php;
+                  include fastcgi_params;
+                  fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+                  fastcgi_param HTTP_PROXY "";
+                  fastcgi_intercept_errors off;
+                  fastcgi_buffer_size 16k;
+                  fastcgi_buffers 4 16k;
+              }
+              location ~ /\.ht {
+                  deny all;
+              }
+          }
+          EOL'
+          sudo ln -s /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-enabled/pterodactyl.conf
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo nginx -t
           sudo systemctl restart nginx
 
       - name: Create VPS User
@@ -110,46 +160,4 @@ jobs:
             sudo useradd -m -s /bin/bash neonh0st
             echo "neonh0st:neonh0st" | sudo chpasswd
             sudo usermod -aG sudo neonh0st
-            echo "neonh0st ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/neonh0st
-          fi
-
-      - name: Show Connection Info
-        run: |
-          echo "✅ VPS is running!"
-          echo "----------------------------------------"
-          echo "➡️ Tailscale IP: $(tailscale ip -4)"
-          echo "➡️ SSH User: neonh0st"
-          echo "➡️ SSH Pass: neonh0st"
-          echo "---"
-          echo "➡️ Pterodactyl URL: http://$(tailscale ip -4)"
-          echo "➡️ Pterodactyl User: neonh0st"
-          echo "➡️ Pterodactyl Pass: neonh0st"
-          echo "----------------------------------------"
-
-      - name: Keep VPS Alive
-        run: sleep 900  # 15 minutes
-
-      - name: Backup VPS data
-        run: |
-          echo "💾 Starting backup process..."
-          sudo mkdir -p /opt/vps-backup/data
-          
-          # Backup Pterodactyl files
-          sudo cp -r /var/www/pterodactyl /opt/vps-backup/data/
-          
-          # Backup Pterodactyl Database
-          DB_PASS=$(grep '^DB_PASSWORD=' /var/www/pterodactyl/.env | cut -d'=' -f2)
-          sudo mysqldump pterodactyl --user=pterodactyl --password="${DB_PASS}" > /opt/vps-backup/data/pterodactyl.sql
-
-          # Backup Tailscale state
-          sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/
-          
-          # Package the backup
-          sudo chown -R $USER:$USER /opt/vps-backup
-          zip -r backup.zip /opt/vps-backup
-
-      - name: Upload VPS backup artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: vps-backup
-          path: backup.zip
+            echo "neonh0st ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudo
