@@ -1,0 +1,155 @@
+name: Pterodactyl
+
+on:
+  workflow_dispatch:
+
+jobs:
+  vps-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25 # Set to 25 mins for a short test run
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Download VPS backup
+        uses: actions/download-artifact@v4
+        with:
+          name: vps-backup
+          path: ./backup
+        continue-on-error: true
+
+      - name: Restore backup files
+        id: restore
+        run: |
+          if [ -f ./backup/backup.zip ]; then
+            sudo unzip -o ./backup/backup.zip -d /
+            echo "✅ Backup restored successfully."
+            echo "cache-hit=true" >> $GITHUB_OUTPUT
+          else
+            echo "🧊 No backup found, starting fresh install."
+            echo "cache-hit=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip sudo software-properties-common ca-certificates apt-transport-https
+          # Install PHP, Nginx, MariaDB, Redis, etc.
+          sudo add-apt-repository -y ppa:ondrej/php
+          sudo apt-get update
+          sudo apt-get install -y nginx mariadb-server redis-server
+          sudo apt-get install -y php8.2 php8.2-cli php8.2-gd php8.2-mysql php8.2-pdo php8.2-mbstring php8.2-tokenizer php8.2-bcmath php8.2-xml php8.2-fpm php8.2-curl php8.2-zip
+          # Install Composer
+          curl -sS https://getcomposer.org/installer | sudo php -- --install-dir=/usr/local/bin --filename=composer
+
+      - name: Start and Restore Services
+        run: |
+          # Start services
+          sudo systemctl start nginx mariadb redis-server
+          
+          # Restore Tailscale state if it exists
+          if [ -f /opt/vps-backup/data/tailscaled.state ]; then
+            sudo mkdir -p /var/lib/tailscale
+            sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state
+            sudo chmod 600 /var/lib/tailscale/tailscaled.state
+          fi
+          
+          # Restore Database if it exists
+          if [ -f /opt/vps-backup/data/pterodactyl.sql ]; then
+            sudo mysql -e "CREATE DATABASE IF NOT EXISTS pterodactyl;"
+            sudo mysql pterodactyl < /opt/vps-backup/data/pterodactyl.sql
+            echo "✅ Database restored."
+          fi
+
+      - name: Connect to Tailscale
+        run: |
+          sudo hostnamectl set-hostname neonh0st
+          sudo tailscaled &
+          sleep 8
+          sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=neonh0st || echo "Tailscale already up"
+
+      - name: Pterodactyl Panel Installation (First Run Only)
+        if: steps.restore.outputs.cache-hit == 'false'
+        run: |
+          echo "🚀 Starting Pterodactyl fresh installation..."
+          DB_PASSWORD=$(openssl rand -base64 16 | tr -d "=\/\+")
+          
+          # 1. Setup MariaDB
+          sudo mysql -e "CREATE USER 'pterodactyl'@'127.0.0.1' IDENTIFIED BY '${DB_PASSWORD}';"
+          sudo mysql -e "CREATE DATABASE pterodactyl;"
+          sudo mysql -e "GRANT ALL PRIVILEGES ON pterodactyl.* TO 'pterodactyl'@'127.0.0.1' WITH GRANT OPTION;"
+          
+          # 2. Download and configure Pterodactyl
+          sudo mkdir -p /var/www/pterodactyl
+          cd /var/www/pterodactyl
+          sudo curl -Lo panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
+          sudo tar -xzvf panel.tar.gz
+          sudo rm -f panel.tar.gz
+          sudo cp .env.example .env
+          
+          # 3. Run Composer
+          sudo composer install --no-dev --optimize-autoloader
+          
+          # 4. Run Artisan setup commands
+          sudo php artisan key:generate --force
+          sudo php artisan p:environment:setup -n --author=admin@example.com --url=http://$(tailscale ip -4) --cache=redis --session=redis --queue=redis --redis-host=127.0.0.1 --redis-port=6379
+          sudo php artisan p:environment:database -n --host=127.0.0.1 --port=3306 --database=pterodactyl --username=pterodactyl --password=${DB_PASSWORD}
+          sudo php artisan migrate --seed --force
+          
+          # 5. Create the admin user 'neonh0st'
+          sudo php artisan p:user:make --admin=1 --username=neonh0st --email=admin@example.com --name-first=Admin --name-last=User --password=neonh0st
+          
+          # 6. Set permissions and configure webserver
+          sudo chown -R www-data:www-data /var/www/pterodactyl/*
+          sudo systemctl restart nginx
+
+      - name: Create VPS User
+        run: |
+          if ! id -u neonh0st >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash neonh0st
+            echo "neonh0st:neonh0st" | sudo chpasswd
+            sudo usermod -aG sudo neonh0st
+            echo "neonh0st ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/neonh0st
+          fi
+
+      - name: Show Connection Info
+        run: |
+          echo "✅ VPS is running!"
+          echo "----------------------------------------"
+          echo "➡️ Tailscale IP: $(tailscale ip -4)"
+          echo "➡️ SSH User: neonh0st"
+          echo "➡️ SSH Pass: neonh0st"
+          echo "---"
+          echo "➡️ Pterodactyl URL: http://$(tailscale ip -4)"
+          echo "➡️ Pterodactyl User: neonh0st"
+          echo "➡️ Pterodactyl Pass: neonh0st"
+          echo "----------------------------------------"
+
+      - name: Keep VPS Alive
+        run: sleep 900  # 15 minutes
+
+      - name: Backup VPS data
+        run: |
+          echo "💾 Starting backup process..."
+          sudo mkdir -p /opt/vps-backup/data
+          
+          # Backup Pterodactyl files
+          sudo cp -r /var/www/pterodactyl /opt/vps-backup/data/
+          
+          # Backup Pterodactyl Database
+          DB_PASS=$(grep '^DB_PASSWORD=' /var/www/pterodactyl/.env | cut -d'=' -f2)
+          sudo mysqldump pterodactyl --user=pterodactyl --password="${DB_PASS}" > /opt/vps-backup/data/pterodactyl.sql
+
+          # Backup Tailscale state
+          sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/
+          
+          # Package the backup
+          sudo chown -R $USER:$USER /opt/vps-backup
+          zip -r backup.zip /opt/vps-backup
+
+      - name: Upload VPS backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-backup
+          path: backup.zip
