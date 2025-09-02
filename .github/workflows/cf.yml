@@ -1,4 +1,4 @@
-name: Continuous Persistent VPS
+name: cf
 
 on:
   schedule:
@@ -64,20 +64,17 @@ jobs:
         if: steps.restore.outputs.cache-hit == 'false'
         run: curl -sS https://getcomposer.org/installer | sudo php -- --install-dir=/usr/local/bin --filename=composer
           
-      - name: Install and Authenticate Cloudflare Tunnel
+      - name: Install Cloudflare Tunnel
         run: |
           sudo curl -sSL https://pkg.cloudflare.com/cloudflare-release.sh | sudo bash
           sudo apt-get install -y cloudflared
-          sudo cloudflared tunnel login
-          echo "CLOUDFLARE_TUNNEL_TOKEN=${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" > cloudflared_creds
 
       - name: Full Pterodactyl Installation (First Run Only)
         if: steps.restore.outputs.cache-hit == 'false'
         run: |
           echo "🚀 Starting Pterodactyl fresh installation..."
           
-          # Replace this with your actual domain and tunnel ID
-          export CLOUDFLARE_TUNNEL_ID="YOUR_TUNNEL_ID"
+          # ⚠️ Update this with your desired public URL ⚠️
           export PUBLIC_URL="vps.yourdomain.com"
           
           # 1. Setup MariaDB for Panel
@@ -156,15 +153,38 @@ jobs:
             sudo usermod -aG sudo toknless
             echo "toknless ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/toknless
           fi
-
-      - name: Start Cloudflare Tunnel and services
+          
+      - name: Configure and Start Cloudflare Tunnel 
         run: |
-          sudo cloudflared tunnel --config cloudflared_creds run ${CLOUDFLARE_TUNNEL_ID} &
-          sudo systemctl restart nginx mariadb redis-server
-          sudo systemctl restart wings
+          # ⚠️ Ensure this file is added and configure your public URL
+          sudo mkdir -p /etc/cloudflared/
+          sudo sh -c 'cat > /etc/cloudflared/config.yml <<EOL
+          tunnel: 90a4b377-ea63-4d0b-9e6e-ecf222b01a86
+          credentials-file: /etc/cloudflared/90a4b377-ea63-4d0b-9e6e-ecf222b01a86.json
+          
+          ingress:
+          - hostname: vps.yourdomain.com
+            service: http://localhost:80
+          - service: http://localhost:8080
+            originRequest:
+              noTLSVerify: true
+          - service: http://localhost:2022
+            originRequest:
+              noTLSVerify: true
+          - service: http_status:404
+          EOL'
+          
+          # Place the token in the credentials file
+          sudo sh -c 'cat > /etc/cloudflared/90a4b377-ea63-4d0b-9e6e-ecf222b01a86.json <<EOL
+          {"a":"c29ec4b39680a658ac0c187d4ec40d83","t":"90a4b377-ea63-4d0b-9e6e-ecf222b01a86","s":"YTZ3MjhlMzdlNTdlOTdlODJkODJkOTE2MjI1YjYzZTI2ZjJkZWVkZWIyYmIy"}
+          EOL'
+          
+          # Start the tunnel service
+          sudo cloudflared tunnel --config /etc/cloudflared/config.yml run
 
-      - name: Show connection info
+      - name: Show connection info and check service status
         run: |
+          # ⚠️ Update this with your desired public URL ⚠️
           export PUBLIC_URL="vps.yourdomain.com"
           echo "✅ VPS is running!"
           echo "----------------------------------------"
@@ -175,6 +195,7 @@ jobs:
           echo "Service Status Checks:"
           sudo systemctl status nginx
           sudo systemctl status wings
+          sudo systemctl status cloudflared
 
       - name: Keep VPS alive
         run: sleep 20700  # 5 hours 45 minutes
