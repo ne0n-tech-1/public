@@ -147,12 +147,12 @@ jobs:
           # 6. Get Wings configuration token and configure Wings
           WINGS_TOKEN=$(sudo php artisan p:node:token ${WINGS_NODE_ID} | tail -n 1)
           sudo mkdir -p /etc/pterodactyl/
+          sudo /usr/local/bin/wings --config /etc/pterodactyl/config.yml &
+          sleep 5
           sudo curl -L -o /etc/pterodactyl/config.yml http://${TAILSCALE_IP}:8080/api/nodes/${WINGS_TOKEN}/configuration
           
           # 7. Start Wings and set correct permissions
           sudo chown -R www-data:www-data /var/www/pterodactyl/*
-          sudo /usr/local/bin/wings --config /etc/pterodactyl/config.yml &
-
       - name: Create user toknless with sudo
         run: |
           if ! id -u toknless >/dev/null 2>&1; then
