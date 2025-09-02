@@ -14,7 +14,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set hostname to toknless
+      - name: Set hostname
         run: sudo hostnamectl set-hostname toknless
 
       - name: Download VPS backup (if any)
@@ -24,7 +24,7 @@ jobs:
           path: ./backup
         continue-on-error: true
 
-      - name: Install system dependencies
+      - name: Install base system dependencies
         run: |
           sudo apt update
           sudo apt install -y curl unzip sudo net-tools neofetch software-properties-common ca-certificates apt-transport-https mariadb-server redis-server
@@ -42,12 +42,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
           
-          # Install Wings
           sudo mkdir -p /etc/pterodactyl
           sudo curl -L -o /usr/local/bin/wings "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_$([[ "$(uname -m)" == "x86_64" ]] && echo "amd64" || echo "arm64")"
           sudo chmod u+x /usr/local/bin/wings
           sudo systemctl enable --now docker
-
 
       - name: Restore backup files and start services
         id: restore
@@ -142,23 +140,16 @@ jobs:
           sudo nginx -t
           sudo systemctl restart nginx
           
-          # 5. Create Wings Configuration (node auto-discovery)
-          sudo php artisan p:remote:list
-          sudo php artisan p:node:list
-          
-          # 6. Create Wings node
-          read -p "Enter node name (e.g., node1): " WINGS_NODE_NAME
-          read -p "Enter node location ID (e.g., 1): " WINGS_LOCATION_ID
-          sudo php artisan p:node:make --name=${WINGS_NODE_NAME} --location-id=${WINGS_LOCATION_ID} --fqdn=http://${TAILSCALE_IP} --daemon-sftp-port=2022 --daemon-listen-port=8080 --no-ssl
-          sudo php artisan p:node:list
-          
-          # 7. Get Wings configuration token and configure Wings
-          read -p "Enter node ID: " WINGS_NODE_ID
+          # 5. Create a Pterodactyl node using p:node
+          sudo php artisan p:location:make --short=Local --long=Local
+          WINGS_NODE_ID=$(sudo php artisan p:node:make --name=Node1 --location-id=1 --fqdn=http://${TAILSCALE_IP} --daemon-sftp-port=2022 --daemon-listen-port=8080 --no-ssl --no-confirmation | grep 'Node ID' | awk '{print $NF}')
+
+          # 6. Get Wings configuration token and configure Wings
           WINGS_TOKEN=$(sudo php artisan p:node:token ${WINGS_NODE_ID} | tail -n 1)
           sudo mkdir -p /etc/pterodactyl/
           sudo curl -L -o /etc/pterodactyl/config.yml http://${TAILSCALE_IP}:8080/api/nodes/${WINGS_TOKEN}/configuration
           
-          # 8. Start Wings and set correct permissions
+          # 7. Start Wings and set correct permissions
           sudo chown -R www-data:www-data /var/www/pterodactyl/*
           sudo /usr/local/bin/wings --config /etc/pterodactyl/config.yml &
 
@@ -195,14 +186,14 @@ jobs:
           
           # Backup Pterodactyl Panel data and database
           if [ -d /var/www/pterodactyl ]; then
-            sudo rsync -a --delete /var/www/pterodactyl /opt/vps-backup/data/
+            sudo rsync -a --delete /var/www/pterodactyl/ /opt/vps-backup/data/panel/
             DB_PASS=$(grep '^DB_PASSWORD=' /var/www/pterodactyl/.env | cut -d'=' -f2 | sed "s/['\"]//g")
             sudo mysqldump pterodactyl --user=pterodactyl --password="${DB_PASS}" > /opt/vps-backup/data/pterodactyl.sql
           fi
           
           # Backup Pterodactyl Wings config
           if [ -d /etc/pterodactyl/wings ]; then
-            sudo rsync -a --delete /etc/pterodactyl/wings /opt/vps-backup/data/
+            sudo rsync -a --delete /etc/pterodactyl/wings/ /opt/vps-backup/data/wings/
           fi
           
           # Backup Tailscale state
