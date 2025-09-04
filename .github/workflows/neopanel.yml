@@ -1,0 +1,281 @@
+name: Continuous Persistent VPS
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+  workflow_dispatch:
+
+jobs:
+  vps-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # --- 1) Try to fetch the latest backup first ---
+      - name: Download VPS backup (if any)
+        id: fetch_backup
+        uses: actions/download-artifact@v4
+        with:
+           name: vps-backup
+           path: ./backup
+        continue-on-error: true
+
+      - name: Check if backup exists
+        id: has_backup
+        run: |
+          if [ -f ./backup/backup.zip ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+          fi
+
+      # --- 2) Base system deps (always needed on fresh runners) ---
+      - name: Set hostname
+        run: sudo hostnamectl set-hostname toknless
+
+      - name: Install base system dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y curl unzip sudo net-tools neofetch software-properties-common ca-certificates apt-transport-https mariadb-server redis-server
+          sudo add-apt-repository -y ppa:ondrej/php
+          sudo apt update
+          sudo apt install -y php8.2 php8.2-cli php8.2-gd php8.2-mysql php8.2-pdo php8.2-mbstring php8.2-tokenizer php8.2-bcmath php8.2-xml php8.2-fpm php8.2-curl php8.2-zip nginx composer
+          sudo apt install -y openssh-server
+
+      - name: Install Docker & Wings binary
+        run: |
+          sudo install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          sudo chmod a+r /etc/apt/keyrings/docker.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          sudo systemctl enable --now docker
+
+          sudo mkdir -p /etc/pterodactyl
+          sudo curl -L -o /usr/local/bin/wings "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_$([[ "$(uname -m)" == "x86_64" ]] && echo "amd64" || echo "arm64")"
+          sudo chmod u+x /usr/local/bin/wings
+
+      # --- 3) If backup exists, restore it BEFORE starting services (includes tailscale state) ---
+      - name: Restore backup files
+        if: steps.has_backup.outputs.found == 'true'
+        id: restore
+        run: |
+          echo "Restoring backup archive..."
+          sudo unzip -o ./backup/backup.zip -d /
+          # Ensure ownership/permissions for tailscale state
+          if [ -f /opt/vps-backup/data/tailscaled.state ]; then
+            sudo mkdir -p /var/lib/tailscale
+            sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state
+            sudo chmod 600 /var/lib/tailscale/tailscaled.state
+          fi
+          echo "cache-hit=true" >> $GITHUB_OUTPUT
+
+      - name: No backup path (marker)
+        if: steps.has_backup.outputs.found == 'false'
+        id: noback
+        run: echo "cache-hit=false" >> $GITHUB_OUTPUT
+
+      # --- 4) Tailscale (use restored state if present to keep same IP) ---
+      - name: Install Tailscale client
+        run: curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Connect to Tailscale with retry (state-aware)
+        run: |
+          sudo tailscaled &
+          sleep 8
+          # Bring up using the same auth key; if state exists, it will retain identity/IP
+          sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=toknless || echo "tailscale up returned non-zero (may already be logged in)"
+          for i in $(seq 1 10); do
+            echo "Attempt $i to get Tailscale IP..."
+            TAILSCALE_IP=$(sudo tailscale ip -4)
+            if [ -n "$TAILSCALE_IP" ]; then
+              echo "Tailscale IP is ready: $TAILSCALE_IP"
+              break
+            fi
+            sleep 10
+          done
+          if [ -z "$TAILSCALE_IP" ]; then
+            echo "❌ Failed to get Tailscale IP after retries."
+            exit 1
+          fi
+
+      # --- 5) Fresh Pterodactyl install ONLY when no backup is found ---
+      - name: Full Pterodactyl Installation (First Run Only)
+        if: steps.noback.outputs.cache-hit == 'false'
+        run: |
+          echo "🚀 Starting fresh Pterodactyl installation..."
+          TAILSCALE_IP=$(sudo tailscale ip -4)
+          DB_PASSWORD=$(openssl rand -base64 16 | tr -d "=\/\+")
+          ADMIN_PASS=toknless
+
+          # MariaDB
+          sudo systemctl start mariadb redis-server
+          sudo mysql -e "CREATE USER IF NOT EXISTS 'pterodactyl'@'127.0.0.1' IDENTIFIED BY '${DB_PASSWORD}';"
+          sudo mysql -e "CREATE DATABASE IF NOT EXISTS pterodactyl;"
+          sudo mysql -e "GRANT ALL PRIVILEGES ON pterodactyl.* TO 'pterodactyl'@'127.0.0.1' WITH GRANT OPTION;"
+
+          # Panel
+          sudo mkdir -p /var/www/pterodactyl
+          cd /var/www/pterodactyl
+          sudo curl -Lo panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
+          sudo tar -xzvf panel.tar.gz && sudo rm -f panel.tar.gz
+          sudo cp .env.example .env
+          sudo composer install --no-dev --optimize-autoloader
+
+          sudo php artisan key:generate --force
+          sudo php artisan p:environment:setup -n --author=admin@example.com --url=http://${TAILSCALE_IP} --cache=redis --session=redis --queue=redis --redis-host=127.0.0.1 --redis-port=6379
+          sudo php artisan p:environment:database -n --host=127.0.0.1 --port=3306 --database=pterodactyl --username=pterodactyl --password=${DB_PASSWORD}
+          sudo php artisan migrate --seed --force
+          sudo php artisan p:user:make --admin=1 --username=toknless --email=admin@example.com --name-first=Admin --name-last=User --password=${ADMIN_PASS}
+
+          # Nginx
+          sudo tee /etc/nginx/sites-available/pterodactyl.conf >/dev/null <<'EOL'
+          server {
+              listen 80;
+              server_name _;
+              root /var/www/pterodactyl/public;
+              index index.php;
+              location / { try_files $uri $uri/ /index.php?$query_string; }
+              location ~ \.php$ {
+                  fastcgi_pass unix:/var/run/php/php8.2-fpm.sock;
+                  include fastcgi_params;
+                  fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+              }
+              location ~ /\.ht { deny all; }
+          }
+          EOL
+          sudo ln -sf /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-enabled/pterodactyl.conf
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo systemctl enable --now php8.2-fpm
+          sudo nginx -t && sudo systemctl restart nginx
+
+          # Location & Node (non-interactive)
+          cd /var/www/pterodactyl
+          sudo php artisan p:location:make -n --short=Local --long=Local || true
+          NODE_OUTPUT=$(sudo php artisan p:node:make -n --name=Node1 --location-id=1 --fqdn=http://${TAILSCALE_IP} --daemon-sftp-port=2022 --daemon-listen-port=8080 --no-ssl)
+          echo "$NODE_OUTPUT"
+          WINGS_NODE_ID=$(echo "$NODE_OUTPUT" | grep 'Node ID' | awk '{print $NF}')
+          WINGS_TOKEN=$(sudo php artisan p:node:token ${WINGS_NODE_ID} | tail -n 1)
+
+          # Fetch Wings config
+          sudo curl -L -o /etc/pterodactyl/config.yml http://${TAILSCALE_IP}/api/nodes/${WINGS_TOKEN}/configuration
+
+          # Permissions
+          sudo chown -R www-data:www-data /var/www/pterodactyl
+
+      # --- 6) Ensure services running for BOTH paths (fresh or restored) ---
+      - name: Ensure Nginx, DB, Redis
+        run: |
+          sudo systemctl enable --now mariadb redis-server
+          sudo systemctl enable --now php8.2-fpm
+          sudo systemctl enable --now nginx
+
+      - name: Ensure Wings systemd service
+        run: |
+          # Create unit (idempotent)
+          sudo tee /etc/systemd/system/wings.service >/dev/null <<'EOL'
+          [Unit]
+          Description=Pterodactyl Wings Daemon
+          After=docker.service
+          [Service]
+          User=root
+          WorkingDirectory=/etc/pterodactyl
+          ExecStart=/usr/local/bin/wings --config /etc/pterodactyl/config.yml
+          Restart=always
+          RestartSec=5s
+          LimitNOFILE=4096
+          [Install]
+          WantedBy=multi-user.target
+          EOL
+          sudo systemctl daemon-reload
+          # Start only if config exists
+          if [ -f /etc/pterodactyl/config.yml ]; then
+            sudo systemctl enable --now wings
+          else
+            echo "Wings config not found, skipping start (fresh install may generate it)."
+          fi
+
+      # --- 7) Cloudflare Tunnel (exposes the panel stably via Cloudflare) ---
+      - name: Start Cloudflare Tunnel container
+        run: |
+          # Remove any existing container with same name to be idempotent
+          sudo docker rm -f cloudflared-tunnel >/dev/null 2>&1 || true
+          sudo docker run -d --name cloudflared-tunnel \
+            --restart unless-stopped \
+            cloudflare/cloudflared:latest \
+            tunnel --no-autoupdate run --token \
+            eyJhIjoiYzI5ZWM0YjM5NjgwYTY1OGFjMGMxODdkNGVjNDBkODMiLCJ0IjoiODM1YzhmZjgtNDUwYi00NzBlLWE1NmEtNTUyNWFmMDQ0ZTJlIiwicyI6Ill6ZGlZekUzTlRFdE1UTmpOeTAwWVRjeUxXSXlObVl0WWpjd05HTmxOekpqTXpnNCJ9
+
+      # --- 8) Local user (optional convenience) ---
+      - name: Create user toknless with sudo
+        run: |
+          if ! id -u toknless >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash toknless
+            echo "toknless:toknless" | sudo chpasswd
+            sudo usermod -aG sudo toknless
+            echo "toknless ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/toknless
+          fi
+
+      - name: Show connection info
+        run: |
+          TAILSCALE_IP=$(sudo tailscale ip -4)
+          echo "✅ VPS is running!"
+          echo "----------------------------------------"
+          echo "🔗 Tailscale IP: ${TAILSCALE_IP}"
+          echo "➡️ SSH User: toknless"
+          echo "➡️ SSH Pass: toknless"
+          echo "---"
+          echo "➡️ Pterodactyl Panel (via Tailscale):  http://${TAILSCALE_IP}"
+          echo "➡️ Pterodactyl User: toknless"
+          echo "➡️ Pterodactyl Pass: toknless"
+          echo "➡️ Cloudflare Tunnel: started (check your Cloudflare dashboard for the public URL)"
+          echo "----------------------------------------"
+
+      - name: Keep VPS alive
+        run: sleep 20700  # 5h45m
+
+      # --- 9) Backup at end of run ---
+      - name: Backup VPS data
+        run: |
+          echo "💾 Starting backup process..."
+          sudo mkdir -p /opt/vps-backup/data
+
+          # Panel dir & DB dump
+          if [ -d /var/www/pterodactyl ]; then
+            sudo rsync -a --delete /var/www/pterodactyl/ /opt/vps-backup/data/panel/
+            if [ -f /var/www/pterodactyl/.env ]; then
+              DB_PASS=$(grep '^DB_PASSWORD=' /var/www/pterodactyl/.env | cut -d'=' -f2 | sed "s/['\"]//g")
+              sudo mysqldump pterodactyl --user=pterodactyl --password="${DB_PASS}" > /opt/vps-backup/data/pterodactyl.sql || true
+            fi
+          fi
+
+          # Wings config
+          if [ -f /etc/pterodactyl/config.yml ]; then
+            sudo cp /etc/pterodactyl/config.yml /opt/vps-backup/data/
+          fi
+
+          # Nginx site
+          if [ -f /etc/nginx/sites-available/pterodactyl.conf ]; then
+            sudo mkdir -p /opt/vps-backup/data/nginx
+            sudo cp /etc/nginx/sites-available/pterodactyl.conf /opt/vps-backup/data/nginx/
+          fi
+
+          # Tailscale state
+          if [ -f /var/lib/tailscale/tailscaled.state ]; then
+            sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/
+          fi
+
+          # Package the backup
+          sudo chown -R $USER:$USER /opt/vps-backup
+          cd / && zip -r backup.zip /opt/vps-backup
+
+      - name: Upload VPS backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-backup
+          path: /backup.zip
+          retention-days: 1
