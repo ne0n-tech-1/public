@@ -1,142 +1,206 @@
-name: Setup Pterodactyl Panel & Node
+name: Continuous Persistent VPS
 
 on:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
   workflow_dispatch:
 
 jobs:
-  setup:
-    runs-on: ubuntu-22.04
+  vps-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Set hostname
+        run: sudo hostnamectl set-hostname toknless
+
+      - name: Download VPS backup (if any)
+        uses: actions/download-artifact@v4
+        with:
+          name: vps-backup
+          path: ./backup
+        continue-on-error: true
+
+      - name: Install base system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y software-properties-common ca-certificates lsb-release apt-transport-https curl unzip mariadb-server redis-server nginx composer jq docker.io
-
-          # Add PHP PPA
+          sudo apt update
+          sudo apt install -y curl unzip sudo net-tools neofetch software-properties-common ca-certificates apt-transport-https mariadb-server redis-server
           sudo add-apt-repository -y ppa:ondrej/php
-          sudo apt-get update
+          sudo apt update
+          sudo apt install -y php8.2 php8.2-cli php8.2-gd php8.2-mysql php8.2-pdo php8.2-mbstring php8.2-tokenizer php8.2-bcmath php8.2-xml php8.2-fpm php8.2-curl php8.2-zip nginx
+          sudo apt install -y openssh-server
 
-          # Install PHP 8.2 + modules
-          sudo apt-get install -y \
-            php8.2-cli php8.2-mysql php8.2-mbstring php8.2-bcmath \
-            php8.2-xml php8.2-fpm php8.2-curl php8.2-zip
-
-      - name: Setup Tailscale
+      - name: Install Docker and Pterodactyl Wings prerequisites
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey=${{ secrets.TS_AUTH_KEY }} --hostname="ptero-vps" --ssh
+          sudo install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          sudo chmod a+r /etc/apt/keyrings/docker.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
           
-          # Assign constant IPs
+          sudo mkdir -p /etc/pterodactyl
+          sudo curl -L -o /usr/local/bin/wings "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_$([[ "$(uname -m)" == "x86_64" ]] && echo "amd64" || echo "arm64")"
+          sudo chmod u+x /usr/local/bin/wings
+          sudo systemctl enable --now docker
+
+      - name: Restore backup files and start services
+        id: restore
+        run: |
+          if [ -f ./backup/backup.zip ]; then
+            sudo unzip -o ./backup/backup.zip -d /
+            sudo systemctl start nginx mariadb redis-server
+            echo "✅ Backup restored successfully."
+            echo "cache-hit=true" >> $GITHUB_OUTPUT
+          else
+            echo "🧊 No backup found, starting fresh install."
+            sudo systemctl start mariadb redis-server
+            echo "cache-hit=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install Tailscale client
+        run: curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Connect to Tailscale with constant IPs
+        run: |
+          sudo tailscaled &
+          sleep 8
+          sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=toknless || echo "Tailscale already up"
+          
+          # Assign constant IPs for panel and node
           sudo ip addr add 100.100.100.10 dev tailscale0 || true
           sudo ip addr add 100.100.100.11 dev tailscale0 || true
           
           echo "PANEL_IP=100.100.100.10" >> $GITHUB_ENV
           echo "NODE_IP=100.100.100.11" >> $GITHUB_ENV
 
-      - name: Restore backup if exists
-        id: restore
-        uses: actions/cache@v3
-        with:
-          path: /etc/pterodactyl
-          key: ptero-backup
-
-      - name: Install Pterodactyl Panel
-        if: steps.restore.outputs.cache-hit != 'true'
+      - name: Full Pterodactyl Installation (First Run Only)
+        if: steps.restore.outputs.cache-hit == 'false'
         run: |
-          cd /var/www
-          sudo mkdir -p pterodactyl
-          sudo chown -R $USER:$USER pterodactyl
-          cd pterodactyl
-          curl -Lo panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
-          tar -xzvf panel.tar.gz
-          composer install --no-dev --optimize-autoloader
-          
-          cp .env.example .env
-          php artisan key:generate --force
-          php artisan migrate --seed --force
-          
-          sudo chown -R www-data:www-data /var/www/pterodactyl
-          sudo systemctl enable --now php8.2-fpm
+          echo "🚀 Starting Pterodactyl fresh installation..."
+          DB_PASSWORD=$(openssl rand -base64 16 | tr -d "=\/\+")
+          ADMIN_PASS=toknless
+
+          # Setup MariaDB for Panel
+          sudo mysql -e "CREATE USER 'pterodactyl'@'127.0.0.1' IDENTIFIED BY '${DB_PASSWORD}';"
+          sudo mysql -e "CREATE DATABASE pterodactyl;"
+          sudo mysql -e "GRANT ALL PRIVILEGES ON pterodactyl.* TO 'pterodactyl'@'127.0.0.1' WITH GRANT OPTION;"
+
+          # Download and configure Panel
+          sudo mkdir -p /var/www/pterodactyl
+          cd /var/www/pterodactyl
+          sudo curl -Lo panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
+          sudo tar -xzvf panel.tar.gz
+          sudo rm -f panel.tar.gz
+          sudo cp .env.example .env
+          sudo composer install --no-dev --optimize-autoloader
+
+          sudo php artisan key:generate --force
+          sudo php artisan p:environment:setup -n --author=admin@example.com --url=http://${PANEL_IP} --cache=redis --session=redis --queue=redis --redis-host=127.0.0.1 --redis-port=6379
+          sudo php artisan p:environment:database -n --host=127.0.0.1 --port=3306 --database=pterodactyl --username=pterodactyl --password=${DB_PASSWORD}
+          sudo php artisan migrate --seed --force
+          sudo php artisan p:user:make --admin=1 --username=toknless --email=admin@example.com --name-first=Admin --name-last=User --password=${ADMIN_PASS}
+
+          # Configure Nginx
+          sudo sh -c 'cat > /etc/nginx/sites-available/pterodactyl.conf <<EOL
+          server {
+              listen 80;
+              server_name '"$PANEL_IP"';
+              root /var/www/pterodactyl/public;
+              index index.html index.htm index.php;
+              charset utf-8;
+              location / { try_files \$uri \$uri/ /index.php?\$query_string; }
+              location = /favicon.ico { access_log off; log_not_found off; }
+              location = /robots.txt  { access_log off; log_not_found off; }
+              access_log  /var/log/nginx/pterodactyl.app-access.log;
+              error_log   /var/log/nginx/pterodactyl.app-error.log error;
+              location ~ \.php$ {
+                  fastcgi_split_path_info ^(.+\.php)(/.+)$;
+                  fastcgi_pass unix:/var/run/php/php8.2-fpm.sock;
+                  fastcgi_index index.php;
+                  include fastcgi_params;
+                  fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+                  fastcgi_param HTTP_PROXY "";
+                  fastcgi_intercept_errors off;
+                  fastcgi_buffer_size 16k;
+                  fastcgi_buffers 4 16k;
+              }
+              location ~ /\.ht { deny all; }
+          }
+          EOL'
+          sudo ln -s /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-enabled/pterodactyl.conf
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo nginx -t
           sudo systemctl restart nginx
 
-      - name: Insert Application API Key
-        if: steps.restore.outputs.cache-hit != 'true'
-        run: |
+          # Insert API key (fixed: escape `key`)
           API_KEY=$(openssl rand -hex 32)
-          echo "API_KEY=$API_KEY" >> $GITHUB_ENV
-          
-          sudo mysql -e "
-            INSERT INTO application_api_keys (identifier, \`key\`, allowed_ips, created_at, updated_at)
-            VALUES ('installer', '${API_KEY}', NULL, NOW(), NOW());
-          " pterodactyl
+          sudo mysql -D pterodactyl -e "INSERT INTO application_api_keys (identifier, \`key\`, allowed_ips, created_at, updated_at) VALUES ('installer', '${API_KEY}', NULL, NOW(), NOW());"
 
-      - name: Create Location & Node via API
-        if: steps.restore.outputs.cache-hit != 'true'
-        run: |
-          # Create location
+          # Create Location & Node
           curl -s -X POST "http://${PANEL_IP}/api/application/locations" \
             -H "Authorization: Bearer ${API_KEY}" \
             -H "Content-Type: application/json" \
-            -d '{"short": "local", "long": "Local"}'
+            -d '{"short":"local","long":"Local"}'
 
-          # Create node
-          curl -s -X POST "http://${PANEL_IP}/api/application/nodes" \
+          NODE_JSON=$(curl -s -X POST "http://${PANEL_IP}/api/application/nodes" \
             -H "Authorization: Bearer ${API_KEY}" \
             -H "Content-Type: application/json" \
             -d "{
-              \"name\": \"Node1\",
-              \"description\": \"Local Node\",
-              \"location_id\": 1,
-              \"fqdn\": \"${NODE_IP}\",
-              \"scheme\": \"http\",
-              \"memory\": 4096,
-              \"disk\": 10000,
-              \"daemon_base\": \"/var/lib/pterodactyl/volumes\",
-              \"daemon_sftp\": 2022,
-              \"daemon_listen\": 8080
-            }" > node.json
+              \"name\":\"Node1\",
+              \"location_id\":1,
+              \"fqdn\":\"${NODE_IP}\",
+              \"scheme\":\"http\",
+              \"memory\":2048,
+              \"disk\":10000,
+              \"daemon_base\":\"/var/lib/pterodactyl/volumes\",
+              \"daemon_sftp\":2022,
+              \"daemon_listen\":8080
+            }")
 
-          NODE_ID=$(jq -r '.attributes.id' node.json)
-          echo "NODE_ID=$NODE_ID" >> $GITHUB_ENV
+          NODE_ID=$(echo $NODE_JSON | jq -r '.attributes.id')
 
-      - name: Setup Wings
-        if: steps.restore.outputs.cache-hit != 'true'
+          # Wings setup
+          sudo curl -s -X GET "http://${PANEL_IP}/api/application/nodes/${NODE_ID}/configuration" \
+            -H "Authorization: Bearer ${API_KEY}" -o /etc/pterodactyl/config.yml
+          sudo /usr/local/bin/wings --config /etc/pterodactyl/config.yml &
+
+      - name: Install Cloudflare Tunnel
         run: |
-          sudo mkdir -p /etc/pterodactyl
-          curl -L -o /usr/local/bin/wings https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64
-          sudo chmod +x /usr/local/bin/wings
+          curl -fsSL https://pkg.cloudflare.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloudflare-main.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
+          sudo apt-get update && sudo apt-get install -y cloudflared
+          echo "${{ secrets.CF_TUNNEL_TOKEN }}" | sudo cloudflared service install
+          sudo systemctl enable cloudflared
+          sudo systemctl restart cloudflared
 
-          curl -s -X GET "http://${PANEL_IP}/api/application/nodes/${NODE_ID}/configuration" \
-            -H "Authorization: Bearer ${API_KEY}" \
-            -o /etc/pterodactyl/config.yml
+      - name: Keep VPS alive
+        run: sleep 20700  # ~5h45m
 
-          sudo tee /etc/systemd/system/wings.service > /dev/null <<EOL
-          [Unit]
-          Description=Pterodactyl Wings Daemon
-          After=docker.service
-
-          [Service]
-          User=root
-          WorkingDirectory=/etc/pterodactyl
-          ExecStart=/usr/local/bin/wings --config /etc/pterodactyl/config.yml
-          Restart=always
-          RestartSec=5s
-          LimitNOFILE=4096
-
-          [Install]
-          WantedBy=multi-user.target
-          EOL
-
-          sudo systemctl enable --now wings
-
-      - name: Setup Cloudflare Tunnel
+      - name: Backup VPS data
         run: |
-          docker run -d cloudflare/cloudflared:latest tunnel --no-autoupdate run --token ${{ secrets.CF_TUNNEL_TOKEN }}
+          echo "💾 Starting backup process..."
+          sudo mkdir -p /opt/vps-backup/data
+          if [ -d /var/www/pterodactyl ]; then
+            sudo rsync -a --delete /var/www/pterodactyl/ /opt/vps-backup/data/panel/
+            DB_PASS=$(grep '^DB_PASSWORD=' /var/www/pterodactyl/.env | cut -d'=' -f2 | sed "s/['\"]//g")
+            sudo mysqldump pterodactyl --user=pterodactyl --password="${DB_PASS}" > /opt/vps-backup/data/pterodactyl.sql
+          fi
+          if [ -f /var/lib/tailscale/tailscaled.state ]; then
+            sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/
+          fi
+          if [ -d /etc/cloudflared ]; then
+            sudo cp -r /etc/cloudflared /opt/vps-backup/data/cloudflared
+          fi
+          sudo chown -R $USER:$USER /opt/vps-backup
+          zip -r backup.zip /opt/vps-backup
 
-      - name: Schedule Backup
-        run: |
-          echo "*/350 * * * * root tar -czf /tmp/ptero-backup.tar.gz /etc/pterodactyl /var/www/pterodactyl && gh release create backup-\$(date +\%s) /tmp/ptero-backup.tar.gz -R ${{ github.repository }}" \
-            | sudo tee -a /etc/crontab
+      - name: Upload VPS backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-backup
+          path: backup.zip
+          retention-days: 1
