@@ -10,12 +10,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v3
 
-      - name: Install dependencies
+     - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl unzip mariadb-server redis-server php8.2-cli \
-            php8.2-mysql php8.2-mbstring php8.2-bcmath php8.2-xml php8.2-fpm \
-            nginx composer jq docker.io
+          sudo apt-get install -y software-properties-common ca-certificates lsb-release apt-transport-https curl unzip mariadb-server redis-server nginx composer jq docker.io
+
+          # Add PHP PPA
+          sudo add-apt-repository -y ppa:ondrej/php
+          sudo apt-get update
+
+          # Install PHP 8.2 + modules
+          sudo apt-get install -y \
+            php8.2-cli php8.2-mysql php8.2-mbstring php8.2-bcmath \
+            php8.2-xml php8.2-fpm php8.2-curl php8.2-zip
 
       - name: Setup Tailscale
         run: |
